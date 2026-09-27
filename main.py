@@ -23,12 +23,12 @@ class Token:
     BACKSPACE_TWO = "backspace_two"
     BACKSPACE_THREE = "backspace_three"
 
-def questions(only_letters: list[str] | None = None) -> dict[str, Noul]:
+def questions(only_letters: list[str] | None = None, current_response: str = "") -> dict[str, Noul]:
     # print(f"ONLY LETTERS: {only_letters}")
     questions_dict = {}
     for letter in letters:
         questions_dict[letter] = Noul(
-            instructions=f"Should the next character appended to `response` be the letter '{letter}'?"
+            instructions=f"Should the next character appended to '{current_response}' be the letter '{letter}'?"
         )
     questions_dict[Token.WHITESPACE] = Noul(
         instructions="Should the next character appended to `response` be a single space (' ')?"
@@ -118,7 +118,12 @@ class Client:
 
         if not skip_correction:
             for correction_loop in range(correction_loops):
-                print(f"Correction loop {correction_loop + 1}")
+                # print(f"Correction loop {correction_loop + 1}")
+
+                previous_analysis = {}
+                for l, p in top:
+                    previous_analysis[l] = p
+                # print(f"Previous analysis: {previous_analysis}")
 
                 response = self.client.system_one(
                     state={
@@ -129,9 +134,9 @@ class Client:
                         ),
                         "text": input_text,
                         "response": current_response,
-                        "previous_analysis": response.nouls,
+                        "previous_analysis": previous_analysis,
                     },
-                    questions=questions([l for l, _ in top]),
+                    questions=questions(),
                 )
                 top = top_letters(response.nouls, 10)
                 print(f"Probabilities[{correction_loop + 1}]: {top}")
@@ -156,13 +161,6 @@ class Client:
             case Token.BACKSPACE_THREE:
                 self.response = current_response[:-3]
                 next_letter = ""
-        # top_5_letters_with_p = sorted(second_response.nouls, key=lambda l: second_response.nouls[l].noul, reverse=True)[:5]
-        # print(f"Top 5 letters with probabilities: {[(letter, second_response.nouls[letter].noul) for letter in top_5_letters_with_p]}")
-        # second_next_letter = max(second_response.nouls, key=lambda l: second_response.nouls[l].noul)
-
-        # if second_next_letter != next_letter:
-        #     print(f"Correction applied: {next_letter} -> {second_next_letter}")
-        #     next_letter = second_next_letter
 
         # Determine the next letter based on the highest probability
         return next_letter
@@ -176,7 +174,7 @@ def main() -> None:
             " `response` is the partial draft written so far."
             " Judge the candidates for the single next character. Lowercase letters only."
         ),
-        input_text="Respond with: 'hello world!'",
+        input_text="Respond with: 'hello world'",
         letters_count=30,
         correction_loops=3,
     )
