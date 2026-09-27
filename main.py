@@ -12,8 +12,10 @@ load_dotenv()
 
 GATEWAY_URL = "https://api.typesafe.ai"
 
+N_LAST_ACTIONS = 10
+
 # Letters + whitespace
-letters = "abcdefghijklmnopqrstuvwxyz"
+letters = "abcdefghijklmnopqrstuvwxyz1234567890"
 class Token:
     WHITESPACE = "whitespace"
     DOT = "dot"
@@ -27,44 +29,89 @@ def questions(only_letters: list[str] | None = None, current_response: str = "")
     # print(f"ONLY LETTERS: {only_letters}")
     questions_dict = {}
     for letter in letters:
+        appended = current_response + letter
         questions_dict[letter] = Noul(
-            instructions=f"Should the next character appended to '{current_response}' be the letter '{letter}'?"
+            instructions=(
+                f"The draft answer so far is {current_response!r}."
+                f" Appending the letter {letter!r} would make it {appended!r}."
+                f" Would {appended!r} be a correct start of the answer that `text` asks for?"
+            )
         )
+
+    with_space = current_response + " "
     questions_dict[Token.WHITESPACE] = Noul(
-        instructions="Should the next character appended to `response` be a single space (' ')?"
+        instructions=(
+            f"The draft answer so far is {current_response!r}."
+            f" Appending a single space (' ') would make it {with_space!r}."
+            f" Would {with_space!r} be a correct start of the answer that `text` asks for?"
+        )
     )
+    with_dot = current_response + "."
     questions_dict[Token.DOT] = Noul(
-        instructions="Should the next character appended to `response` be a period ('.')?"
+        instructions=(
+            f"The draft answer so far is {current_response!r}."
+            f" Appending a period ('.') would make it {with_dot!r}."
+            f" Would {with_dot!r} be a correct start of the answer that `text` asks for?"
+        )
     )
+    with_question_mark = current_response + "?"
     questions_dict[Token.QUESTION_MARK] = Noul(
-        instructions="Should the next character appended to `response` be a question mark ('?')?"
+        instructions=(
+            f"The draft answer so far is {current_response!r}."
+            f" Appending a question mark ('?') would make it {with_question_mark!r}."
+            f" Would {with_question_mark!r} be a correct start of the answer that `text` asks for?"
+        )
     )
     questions_dict[Token.FINISHED] = Noul(
-        instructions="Is `response` already the complete, finished answer to the instruction in `text`?",
+        instructions=(
+            f"The draft answer is {current_response!r}."
+            " Is it already the complete, finished answer to the instruction in `text`,"
+            " so nothing more should be appended?"
+        ),
         criteria={
-            "true": "`response` fulfills the instruction in `text` exactly; appending any further character would make it wrong.",
-            "false": "`response` is empty, unfinished, or still contains a mistake.",
+            "true": "The draft fulfills the instruction in `text` exactly; appending any further character would make it wrong.",
+            "false": "The draft is empty, unfinished, or contains a mistake.",
         },
     )
     questions_dict[Token.BACKSPACE] = Noul(
-        instructions="Is the last character of `response` a mistake that should be deleted?",
+        instructions=(
+            f"The draft answer is {current_response!r}."
+            f" Is its last character wrong, so that deleting just it (leaving {current_response[:-1]!r})"
+            " is the correct next edit?"
+        ),
         criteria={
-            "true": "`response` is not a correct start of the answer requested in `text`; deleting its last character brings it closer.",
-            "false": "`response` so far is a correct start of the answer requested in `text`, or `response` is empty.",
+            "true": "The last character of the draft is wrong; removing only it leaves a correct start of the requested answer.",
+            "false": "The draft as it stands is a correct start of the requested answer, or it is empty.",
         },
     )
     questions_dict[Token.BACKSPACE_TWO] = Noul(
-        instructions="Are the last two characters of `response` a mistake that should be deleted?",
+        instructions=(
+            f"The draft answer is {current_response!r}."
+            f" Are its last two characters both wrong, so that deleting both (leaving {current_response[:-2]!r})"
+            " is the correct next edit?"
+        ),
         criteria={
-            "true": "`response` is not a correct start of the answer requested in `text`; deleting its last two characters brings it closer.",
-            "false": "`response` so far is a correct start of the answer requested in `text`, or `response` has fewer than two characters.",
+            "true": "The last two characters of the draft are both wrong; removing them leaves a correct start of the requested answer.",
+            "false": (
+                "The draft as it stands is a correct start of the requested answer,"
+                " deleting two characters would also remove a correct one,"
+                " or the draft has fewer than two characters."
+            ),
         },
     )
     questions_dict[Token.BACKSPACE_THREE] = Noul(
-        instructions="Are the last three characters of `response` a mistake that should be deleted?",
+        instructions=(
+            f"The draft answer is {current_response!r}."
+            f" Are its last three characters all wrong, so that deleting all three (leaving {current_response[:-3]!r})"
+            " is the correct next edit?"
+        ),
         criteria={
-            "true": "`response` is not a correct start of the answer requested in `text`; deleting its last three characters brings it closer.",
-            "false": "`response` so far is a correct start of the answer requested in `text`, or `response` has fewer than three characters.",
+            "true": "The last three characters of the draft are all wrong; removing them leaves a correct start of the requested answer.",
+            "false": (
+                "The draft as it stands is a correct start of the requested answer,"
+                " deleting three characters would also remove a correct one,"
+                " or the draft has fewer than three characters."
+            ),
         },
     )
 
@@ -81,17 +128,23 @@ def top_letters(response: dict[str, NoulAnswer], n: int) -> list[str, float]:
 def best_letter(response: dict[str, NoulAnswer]) -> str:
     return max(response, key=lambda l: response[l].noul)
 
+
 class Client:
     def __init__(self):
         self.client = TypeSafeClient(base_url=GATEWAY_URL)
         self.response = ""
         self.finished = False
+        self.last_actions = []
 
     def complete(self, system_prompt: str, input_text: str, letters_count: int, correction_loops: int) -> str:
         for _ in range(letters_count):
             letter = self.next_letter(system_prompt, input_text, self.response, correction_loops)
+            if self.finished:
+                print("End of text — response complete.")
+                break
             self.response += letter
             print(f"Current response: {self.response}")
+            # print(f"Last actions: {self.last_actions}")
         return self.response
 
     def next_letter(self, system_prompt: str, input_text: str, current_response: str, correction_loops: int) -> str:
@@ -102,8 +155,9 @@ class Client:
                 "system_prompt": system_prompt,
                 "text": input_text,
                 "response": current_response,
+                "last_actions": self.last_actions,
             },
-            questions=questions(),
+            questions=questions(current_response=current_response),
         )
 
         top = top_letters(response.nouls, 10)
@@ -128,15 +182,17 @@ class Client:
                 response = self.client.system_one(
                     state={
                         "system_prompt": system_prompt + (
-                            " This is a verification pass over a shortlist of candidates for the same next character."
-                            " `previous_analysis` holds the first pass's probability for each candidate;"
-                            " treat it as a prior and correct it where it looks wrong."
+                            " This is a second, verification pass on the same decision."
+                            " `previous_analysis` maps the previously top-rated edits to their estimated"
+                            " probability of being the correct one. Use it as a prior: confirm it where it"
+                            " holds up and overrule it where it looks wrong."
                         ),
                         "text": input_text,
                         "response": current_response,
+                        "last_actions": self.last_actions,
                         "previous_analysis": previous_analysis,
                     },
-                    questions=questions(),
+                    questions=questions(current_response=current_response),
                 )
                 top = top_letters(response.nouls, 10)
                 print(f"Probabilities[{correction_loop + 1}]: {top}")
@@ -162,7 +218,15 @@ class Client:
                 self.response = current_response[:-3]
                 next_letter = ""
 
-        # Determine the next letter based on the highest probability
+        if next_letter:
+            action = f"appended {next_letter!r}, draft became {current_response + next_letter!r}"
+        elif self.finished:
+            action = f"declared the draft {current_response!r} finished"
+        else:
+            deleted = len(current_response) - len(self.response)
+            action = f"deleted the last {deleted} character(s), draft became {self.response!r}"
+        self.last_actions = (self.last_actions + [action])[-N_LAST_ACTIONS:]
+
         return next_letter
 
 
@@ -170,13 +234,20 @@ def main() -> None:
     client_instance = Client()
     response = client_instance.complete(
         system_prompt=(
-            "You are composing `response` one character per step, so that it carries out the instruction in `text`."
-            " `response` is the partial draft written so far."
-            " Judge the candidates for the single next character. Lowercase letters only."
+            "You are writing an answer one character at a time, so that it ends up carrying out the"
+            " instruction in `text` exactly. The draft written so far is in `response` and is repeated"
+            " inside each question. Each question proposes one possible next edit: append a specific"
+            " character, delete recent characters, or declare the answer finished. Judge every proposal"
+            " independently on whether it is the correct next edit. Lowercase letters only."
+            " `last_actions` lists the edits already applied to the draft, oldest first. Use it to stay"
+            " consistent and to avoid loops: keep extending the wording the draft has already committed to;"
+            " if `last_actions` shows an edit was applied and then deleted again, that edit was wrong —"
+            " do not endorse it again; and if the draft keeps returning to the same text, favor a"
+            " different edit than the one tried before."
         ),
-        input_text="Respond with: 'hello world'",
-        letters_count=30,
-        correction_loops=3,
+        input_text="What are you?",
+        letters_count=1300,
+        correction_loops=0,
     )
     print(response)
 
