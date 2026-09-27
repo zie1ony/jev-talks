@@ -20,22 +20,62 @@ class Token:
     QUESTION_MARK = "question_mark"
     FINISHED = "end_of_text"
     BACKSPACE = "backspace"
+    BACKSPACE_TWO = "backspace_two"
+    BACKSPACE_THREE = "backspace_three"
 
 def questions(only_letters: list[str] | None = None) -> dict[str, Noul]:
-    print(f"ONLY LETTERS: {only_letters}")
+    # print(f"ONLY LETTERS: {only_letters}")
     questions_dict = {}
-    for letter in only_letters or letters:
-        questions_dict[letter] = Noul(instructions=f"Should the next letter of the `response` be '{letter}'?")
-    questions_dict[Token.WHITESPACE] = Noul(instructions=f"Should the next letter of the `response` be a whitespace?")
-    questions_dict[Token.DOT] = Noul(instructions=f"Should the next letter of the `response` be a dot?")
-    questions_dict[Token.QUESTION_MARK] = Noul(instructions=f"Should the next letter of the `response` be a question mark?")
-    questions_dict[Token.FINISHED] = Noul(instructions=f"Is the `response` complete?")
-    questions_dict[Token.BACKSPACE] = Noul(instructions=f"Should the last letter of the `response` be removed?")
+    for letter in letters:
+        questions_dict[letter] = Noul(
+            instructions=f"Should the next character appended to `response` be the letter '{letter}'?"
+        )
+    questions_dict[Token.WHITESPACE] = Noul(
+        instructions="Should the next character appended to `response` be a single space (' ')?"
+    )
+    questions_dict[Token.DOT] = Noul(
+        instructions="Should the next character appended to `response` be a period ('.')?"
+    )
+    questions_dict[Token.QUESTION_MARK] = Noul(
+        instructions="Should the next character appended to `response` be a question mark ('?')?"
+    )
+    questions_dict[Token.FINISHED] = Noul(
+        instructions="Is `response` already the complete, finished answer to the instruction in `text`?",
+        criteria={
+            "true": "`response` fulfills the instruction in `text` exactly; appending any further character would make it wrong.",
+            "false": "`response` is empty, unfinished, or still contains a mistake.",
+        },
+    )
+    questions_dict[Token.BACKSPACE] = Noul(
+        instructions="Is the last character of `response` a mistake that should be deleted?",
+        criteria={
+            "true": "`response` is not a correct start of the answer requested in `text`; deleting its last character brings it closer.",
+            "false": "`response` so far is a correct start of the answer requested in `text`, or `response` is empty.",
+        },
+    )
+    questions_dict[Token.BACKSPACE_TWO] = Noul(
+        instructions="Are the last two characters of `response` a mistake that should be deleted?",
+        criteria={
+            "true": "`response` is not a correct start of the answer requested in `text`; deleting its last two characters brings it closer.",
+            "false": "`response` so far is a correct start of the answer requested in `text`, or `response` has fewer than two characters.",
+        },
+    )
+    questions_dict[Token.BACKSPACE_THREE] = Noul(
+        instructions="Are the last three characters of `response` a mistake that should be deleted?",
+        criteria={
+            "true": "`response` is not a correct start of the answer requested in `text`; deleting its last three characters brings it closer.",
+            "false": "`response` so far is a correct start of the answer requested in `text`, or `response` has fewer than three characters.",
+        },
+    )
 
+    if only_letters is not None:
+        questions_dict = {k: v for k, v in questions_dict.items() if k in only_letters}
+
+    # print(f"Generated questions: {list(questions_dict.keys())}")
     return questions_dict
 
-def top_letters(response: dict[str, NoulAnswer]) -> list[str, float]:
-    top_5_letters_with_p = sorted(response, key=lambda l: response[l].noul, reverse=True)[:5]
+def top_letters(response: dict[str, NoulAnswer], n: int) -> list[str, float]:
+    top_5_letters_with_p = sorted(response, key=lambda l: response[l].noul, reverse=True)[:n]
     return [(letter, response[letter].noul) for letter in top_5_letters_with_p]
 
 def best_letter(response: dict[str, NoulAnswer]) -> str:
@@ -66,29 +106,36 @@ class Client:
             questions=questions(),
         )
 
-        top_5 = top_letters(response.nouls)
-        print(f"Probabilities[0]: {top_5}")
+        top = top_letters(response.nouls, 10)
+        print(f"Probabilities[0]: {top}")
 
-        next_letter = best_letter(response.nouls)
+        next_letter = top[0][0]
+        next_letter_probability = top[0][1]
 
-        for correction_loop in range(correction_loops):
-            print(f"Correction loop {correction_loop + 1}")
+        skip_correction = False
+        if next_letter_probability > 0.9:
+            skip_correction = True
 
-            correction_response = self.client.system_one(
-                state={
-                    "system_prompt": system_prompt,
-                    "text": input_text,
-                    "response": current_response,
-                    "previous_analysis": response.nouls,
-                },
-                questions=questions([l for l, _ in top_5]),
-            )
-            top_5_correction = top_letters(correction_response.nouls)
-            print(f"Probabilities[{correction_loop + 1}]: {top_5_correction}")
-            next_letter_correction = best_letter(correction_response.nouls)
-            if next_letter_correction != next_letter:
-                print(f"Correction applied: {next_letter} -> {next_letter_correction}")
-                next_letter = next_letter_correction
+        if not skip_correction:
+            for correction_loop in range(correction_loops):
+                print(f"Correction loop {correction_loop + 1}")
+
+                response = self.client.system_one(
+                    state={
+                        "system_prompt": system_prompt + (
+                            " This is a verification pass over a shortlist of candidates for the same next character."
+                            " `previous_analysis` holds the first pass's probability for each candidate;"
+                            " treat it as a prior and correct it where it looks wrong."
+                        ),
+                        "text": input_text,
+                        "response": current_response,
+                        "previous_analysis": response.nouls,
+                    },
+                    questions=questions([l for l, _ in top]),
+                )
+                top = top_letters(response.nouls, 10)
+                print(f"Probabilities[{correction_loop + 1}]: {top}")
+                next_letter = best_letter(response.nouls)
 
         match next_letter:
             case Token.WHITESPACE:
@@ -102,6 +149,12 @@ class Client:
                 next_letter = ""
             case Token.BACKSPACE:
                 self.response = current_response[:-1]
+                next_letter = ""
+            case Token.BACKSPACE_TWO:
+                self.response = current_response[:-2]
+                next_letter = ""
+            case Token.BACKSPACE_THREE:
+                self.response = current_response[:-3]
                 next_letter = ""
         # top_5_letters_with_p = sorted(second_response.nouls, key=lambda l: second_response.nouls[l].noul, reverse=True)[:5]
         # print(f"Top 5 letters with probabilities: {[(letter, second_response.nouls[letter].noul) for letter in top_5_letters_with_p]}")
@@ -118,9 +171,13 @@ class Client:
 def main() -> None:
     client_instance = Client()
     response = client_instance.complete(
-        system_prompt="Follow the instruction in `text`. Respond one letter at the time. Lowercase only.",
+        system_prompt=(
+            "You are composing `response` one character per step, so that it carries out the instruction in `text`."
+            " `response` is the partial draft written so far."
+            " Judge the candidates for the single next character. Lowercase letters only."
+        ),
         input_text="Respond with: 'hello world!'",
-        letters_count=15,
+        letters_count=30,
         correction_loops=3,
     )
     print(response)
