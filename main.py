@@ -22,7 +22,7 @@ GATEWAY_URL = "https://api.typesafe.ai"
 N_LAST_ACTIONS = 10
 
 # User-defined game parameters.
-LOOKAHEAD = 5   # scouting horizon: could the word be one of the next LOOKAHEAD words
+LOOKAHEAD = 3   # scouting horizon: could the word be one of the next LOOKAHEAD words
 TOP_WORDS = 20  # how many scouted words advance to the arranging phase
 LENGTH = 2      # max words per placed arrangement (raising to 3 adds P(20,3)=6840 candidates)
 
@@ -128,6 +128,24 @@ class Client:
         self.response = ""
         self.finished = False
         self.last_actions = []
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_calls = 0
+
+    def system_one(self, **kwargs):
+        """Wrap the SDK call so every request's `.usage` is accumulated."""
+        response = self.client.system_one(**kwargs)
+        self.total_input_tokens += response.usage.input_tokens or 0
+        self.total_output_tokens += response.usage.output_tokens or 0
+        self.total_calls += 1
+        return response
+
+    def print_usage(self) -> None:
+        total = self.total_input_tokens + self.total_output_tokens
+        print(
+            f"\nToken usage over {self.total_calls} calls: "
+            f"{self.total_input_tokens} input + {self.total_output_tokens} output = {total} total"
+        )
 
     def complete(self, system_prompt: str, input_text: str, steps_count: int, correction_loops: int) -> str:
         for _ in range(steps_count):
@@ -137,12 +155,13 @@ class Client:
                 break
             self.response += placed
             print(f"Current response: {self.response}")
+        self.print_usage()
         return self.response
 
     def next_move(self, system_prompt: str, input_text: str, current_response: str, correction_loops: int) -> str:
         print(f"\n[x] Determining next move. Answer so far: '{current_response}'")
 
-        scout_response = self.client.system_one(
+        scout_response = self.system_one(
             state={
                 "system_prompt": system_prompt,
                 "phase": "scouting: rate each word's chance to appear among the next words",
@@ -172,7 +191,7 @@ class Client:
             "last_actions": self.last_actions,
         }
 
-        response = self.client.system_one(
+        response = self.system_one(
             state=state,
             questions=arrangement_questions(phrases, current_response),
         )
@@ -189,7 +208,7 @@ class Client:
                 for key, probability in top:
                     previous_analysis[key] = probability
 
-                response = self.client.system_one(
+                response = self.system_one(
                     state={
                         **state,
                         "system_prompt": system_prompt + (
@@ -256,9 +275,9 @@ def main() -> None:
             " removed, do not place them again; if the last round placed nothing, favor different"
             " words now."
         ),
-        input_text="What is the most successful scam in history?",
-        steps_count=30,
-        correction_loops=1,
+        input_text="Tell me a short joke.",
+        steps_count=100,
+        correction_loops=3,
     )
     print(response)
 
