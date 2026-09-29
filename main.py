@@ -9,7 +9,10 @@ the answer complete.
 Reads TYPESAFE_API_KEY from .env. Usage: uv run main.py
 """
 
-from itertools import permutations
+import _thread
+import sys
+import threading
+from itertools import cycle, permutations
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,10 +24,20 @@ GATEWAY_URL = "https://api.typesafe.ai"
 
 N_LAST_ACTIONS = 10
 
+# Verbose logging; enabled by the --debug flag. When off, only the answer is printed.
+DEBUG = False
+
+
+def debug(*args, **kwargs) -> None:
+    if DEBUG:
+        print(*args, **kwargs)
+
+
 # User-defined game parameters.
-LOOKAHEAD = 3   # scouting horizon: could the word be one of the next LOOKAHEAD words
-TOP_WORDS = 20  # how many scouted words advance to the arranging phase
-LENGTH = 2      # max words per placed arrangement (raising to 3 adds P(20,3)=6840 candidates)
+LOOKAHEAD = 3     # scouting horizon: could the word be one of the next LOOKAHEAD words
+TOP_WORDS = 30    # how many scouted words advance to the arranging phase
+LENGTH = 2        # max words per placed arrangement (raising to 3 adds P(20,3)=6840 candidates)
+SCOUT_BATCH = 1000  # words scouted per request; large vocabularies are split to stay under the token limit
 
 
 class Token:
@@ -33,8 +46,12 @@ class Token:
     NONE_FITS = "none_of_them_fits"
 
 
-# Basic English 850 word list; the vocabulary being scouted.
-all_words = Path(__file__).with_name("basic-english-850.txt").read_text().lower().split()
+# The vocabulary being scouted.
+all_words = Path(__file__).with_name("top-english-3000.txt").read_text().lower().split()
+
+
+def chunked(seq: list[str], size: int) -> list[list[str]]:
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
 def append_words(text: str, phrase: str) -> str:
@@ -45,10 +62,10 @@ def remove_last_words(text: str, n: int) -> str:
     return " ".join(text.split()[:-n])
 
 
-def scout_questions() -> dict[str, Noul]:
+def scout_questions(word_batch: list[str]) -> dict[str, Noul]:
     return {
         word: Noul(instructions=f"Could {word!r} be one of the next {LOOKAHEAD} words of the answer?")
-        for word in all_words
+        for word in word_batch
     }
 
 
@@ -142,38 +159,61 @@ class Client:
 
     def print_usage(self) -> None:
         total = self.total_input_tokens + self.total_output_tokens
-        print(
+        debug(
             f"\nToken usage over {self.total_calls} calls: "
             f"{self.total_input_tokens} input + {self.total_output_tokens} output = {total} total"
         )
 
     def complete(self, system_prompt: str, input_text: str, steps_count: int, correction_loops: int) -> str:
         for _ in range(steps_count):
-            placed = self.next_move(system_prompt, input_text, self.response, correction_loops)
+            if DEBUG:
+                placed = self.next_move(system_prompt, input_text, self.response, correction_loops)
+            else:
+                # Spin a loader after the answer-so-far while the (blocking) move is computed.
+                with Spinner(self.response):
+                    placed = self.next_move(system_prompt, input_text, self.response, correction_loops)
             if self.finished:
-                print("Answer declared complete.")
+                debug("Answer declared complete.")
                 break
             self.response += placed
-            print(f"Current response: {self.response}")
+            if DEBUG:
+                debug(f"Current response: {self.response}")
+            else:
+                # Redraw the answer-so-far in place. Clearing the line first lets a removed
+                # word shrink it, instead of leaving stale characters behind.
+                render_progress(self.response)
+        if not DEBUG and self.response.strip():
+            # The finishing move also ran under a Spinner, whose normal exit cleared the line.
+            # Redraw the final answer before ending the line, so a completed run shows its
+            # answer instead of a blank line.
+            render_progress(self.response)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         self.print_usage()
         return self.response
 
     def next_move(self, system_prompt: str, input_text: str, current_response: str, correction_loops: int) -> str:
-        print(f"\n[x] Determining next move. Answer so far: '{current_response}'")
+        debug(f"\n[x] Determining next move. Answer so far: '{current_response}'")
 
-        scout_response = self.system_one(
-            state={
-                "system_prompt": system_prompt,
-                "phase": "scouting: rate each word's chance to appear among the next words",
-                "text": input_text,
-                "response": current_response,
-                "last_actions": self.last_actions,
-            },
-            questions=scout_questions(),
-        )
-        scouted_with_p = top_answers(scout_response.nouls, TOP_WORDS)
+        scout_state = {
+            "system_prompt": system_prompt,
+            "phase": "scouting: rate each word's chance to appear among the next words",
+            "text": input_text,
+            "response": current_response,
+            "last_actions": self.last_actions,
+        }
+        # Scout the whole vocabulary in batches so no single request exceeds the token limit,
+        # then merge the per-batch judgments and rank across all of them together.
+        batches = chunked(all_words, SCOUT_BATCH)
+        scout_nouls: dict[str, NoulAnswer] = {}
+        for batch_index, batch in enumerate(batches, start=1):
+            debug(f"Scouting batch {batch_index}/{len(batches)} ({len(batch)} words)")
+            scout_response = self.system_one(state=scout_state, questions=scout_questions(batch))
+            scout_nouls.update(scout_response.nouls)
+
+        scouted_with_p = top_answers(scout_nouls, TOP_WORDS)
         scouted = [word for word, _ in scouted_with_p]
-        print(f"Scouted words: {scouted_with_p}")
+        debug(f"Scouted words: {scouted_with_p}")
 
         phrases = arrangement_candidates(scouted)
         state = {
@@ -197,7 +237,7 @@ class Client:
         )
 
         top = top_answers(response.nouls, 10)
-        print(f"Probabilities[0]: {top}")
+        debug(f"Probabilities[0]: {top}")
 
         choice = top[0][0]
         choice_probability = top[0][1]
@@ -226,7 +266,7 @@ class Client:
                     ),
                 )
                 top = top_answers(response.nouls, 10)
-                print(f"Probabilities[{correction_loop + 1}]: {top}")
+                debug(f"Probabilities[{correction_loop + 1}]: {top}")
                 choice = best_answer(response.nouls)
 
         match choice:
@@ -254,33 +294,144 @@ class Client:
         return placed
 
 
+SYSTEM_PROMPT = (
+    "You are composing an answer to `text` word by word, in two repeating phases."
+    " In the scouting phase, every vocabulary word is rated: could it be one of the next"
+    f" {LOOKAHEAD} words of the answer? In the arranging phase, the {TOP_WORDS} best-rated"
+    " words (`scouted_words`) are combined into candidate sequences (`candidates`), and each"
+    " is judged as a possible next move."
+    " `response` is the answer built so far; a space is added automatically when placing."
+    " The moves: place one candidate sequence at the end of `response`, take the last word"
+    " off, place nothing this round because none of the candidates fits, or declare the"
+    " answer complete. Judge every question independently: is it the best next move toward a"
+    " short, good answer to `text`?"
+    " The candidates come from words scouted as likely, so usually one of them fits; place"
+    " nothing only when every arrangement genuinely reads wrong."
+    " `last_actions` lists the most recent moves, oldest first. Use it to stay consistent and"
+    " avoid loops: keep extending the sentence already built; if words were placed and then"
+    " removed, do not place them again; if the last round placed nothing, favor different"
+    " words now."
+)
+
+USAGE = (
+    'Usage: uv run main.py [--debug] "<your question>"\n\n'
+    "Composes an answer to the question one word at a time using Jev.\n"
+    "  --debug   print the full scouting/arranging trace and token usage\n"
+    'Example: uv run main.py "What is the capital of France?"'
+)
+
+
+def render_progress(text: str) -> None:
+    """Redraw the answer-so-far on one line, clearing it first so removals shrink it."""
+    sys.stdout.write("\r\x1b[2K" + text)
+    sys.stdout.flush()
+
+
+class Spinner:
+    """Animate a loader after `prefix` on one line until the enclosed work finishes.
+
+    Runs in a daemon thread; the main thread does the blocking work inside the
+    `with` block. On a normal exit the line is cleared so the caller can redraw it;
+    if the block is interrupted, the loader is dropped but `prefix` is left on the line.
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, prefix: str, interval: float = 0.1):
+        self.prefix = prefix
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self) -> None:
+        sep = " " if self.prefix else ""
+        for frame in cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stdout.write(f"\r\x1b[2K{self.prefix}{sep}{frame}")
+            sys.stdout.flush()
+            self._stop.wait(self.interval)
+
+    def __enter__(self) -> "Spinner":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._stop.set()
+        self._thread.join()
+        if exc_type is None:
+            # Normal exit: clear the line so the caller can redraw the updated answer.
+            sys.stdout.write("\r\x1b[2K")
+        else:
+            # Interrupted: drop the loader but keep the answer-so-far on the line.
+            sys.stdout.write("\r\x1b[2K" + self.prefix)
+        sys.stdout.flush()
+
+
+def watch_for_eof(stop: threading.Event) -> None:
+    """Ctrl-D at an interactive terminal sends EOF on stdin; interrupt the main thread.
+
+    Typed lines are ignored (this program takes its question from argv); only EOF ends
+    the run. Started only when stdin is a TTY, so piped/background runs are unaffected.
+    """
+    try:
+        while sys.stdin.readline():
+            if stop.is_set():
+                return
+    except Exception:
+        return
+    if not stop.is_set():
+        _thread.interrupt_main()
+
+
 def main() -> None:
+    global DEBUG
+    args = sys.argv[1:]
+    DEBUG = "--debug" in args
+    positional = [arg for arg in args if arg != "--debug"]
+    question = positional[0].strip() if positional else ""
+    if not question:
+        print(USAGE)
+        return
+
+    # Ctrl-D (stdin EOF) ends the run at an interactive terminal; Ctrl-C always does.
+    stop_watch = threading.Event()
+    if sys.stdin.isatty():
+        threading.Thread(target=watch_for_eof, args=(stop_watch,), daemon=True).start()
+
     client_instance = Client()
-    response = client_instance.complete(
-        system_prompt=(
-            "You are composing an answer to `text` word by word, in two repeating phases."
-            " In the scouting phase, every vocabulary word is rated: could it be one of the next"
-            f" {LOOKAHEAD} words of the answer? In the arranging phase, the {TOP_WORDS} best-rated"
-            " words (`scouted_words`) are combined into candidate sequences (`candidates`), and each"
-            " is judged as a possible next move."
-            " `response` is the answer built so far; a space is added automatically when placing."
-            " The moves: place one candidate sequence at the end of `response`, take the last word"
-            " off, place nothing this round because none of the candidates fits, or declare the"
-            " answer complete. Judge every question independently: is it the best next move toward a"
-            " short, good answer to `text`?"
-            " The candidates come from words scouted as likely, so usually one of them fits; place"
-            " nothing only when every arrangement genuinely reads wrong."
-            " `last_actions` lists the most recent moves, oldest first. Use it to stay consistent and"
-            " avoid loops: keep extending the sentence already built; if words were placed and then"
-            " removed, do not place them again; if the last round placed nothing, favor different"
-            " words now."
-        ),
-        input_text="Tell me a short joke.",
-        steps_count=100,
-        correction_loops=3,
-    )
-    print(response)
+    try:
+        response = client_instance.complete(
+            system_prompt=SYSTEM_PROMPT,
+            input_text=question,
+            steps_count=50,
+            correction_loops=1,
+        )
+    except (KeyboardInterrupt, EOFError):
+        # Spinner.__exit__ has dropped the loader and left the answer-so-far on the line.
+        # End that line (only default mode leaves it unterminated), then note the stop.
+        if not DEBUG and client_instance.response.strip():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        print("(stopped by the user)")
+        return
+    finally:
+        stop_watch.set()
+
+    # Default mode already rendered the answer live during composition; here we only finalize
+    # the empty case and, in debug mode, label the final answer beneath the trace.
+    text = response.strip()
+    if DEBUG:
+        debug(f"\nQ: {question}")
+        print(f"A: {text}" if text else "A: (no answer composed)")
+    elif not text:
+        print("(no answer composed)")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        # Backstop for an interrupt that escapes main() (e.g. during final output).
+        print("\n(stopped by the user)")
+        sys.exit(130)
