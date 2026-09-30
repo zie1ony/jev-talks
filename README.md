@@ -1,70 +1,32 @@
-# jev-talks
+# Jev Talks
 
-**A model that cannot write, made to talk.**
+**Yet another experiment that checks Jev's talking skills.**
 
 ![jev-talks composing an answer word by word](demo.gif)
 
-[Jev](https://typesafe.ai) is a *System One* model. You hand it some state and a set of typed yes/no questions, and it returns a calibrated probability for each one. That is all it does. It has no decoder, it never emits a token of text, and its own docs list "generation" as a known failure mode with the advice to use a different model.
-
-This repo makes it talk anyway. Text generation becomes a game of moves, and every move is decided by a few thousand yes/no questions. One Python file, no other model involved.
-
-## How it works
-
-```
-                 question · answer so far · last 10 moves
-                                    │
-       ┌────────────────────────────┼────────────────────────────┐
-       │  one round                 ▼                            │
-       │   ┌──────────────────────────────────────────────┐      │
-       │   │ 1. scout     3,000 common English words      │      │
-       │   │    "could ‹word› be one of the next 3 words  │      │
-       │   │     of the answer?"                          │      │
-       │   │    3 parallel requests × 1,000 questions     │      │
-       │   └───────────────────┬──────────────────────────┘      │
-       │                       │  the 30 most probable words     │
-       │   ┌───────────────────▼──────────────────────────┐      │
-       │   │ 2. arrange   900 phrases of one or two words │      │
-       │   │    "placing ‹phrase› would change the answer │      │
-       │   │     to ‹answer + phrase›. good continuation?"│      │
-       │   │    + take the last word back / pass / finish │      │
-       │   │    1 request × 903 questions                 │      │
-       │   └───────────────────┬──────────────────────────┘      │
-       │                       │  the single most probable move  │
-       │   ┌───────────────────▼──────────────────────────┐      │
-       │   │ 3. apply     append the phrase, or pop the   │      │
-       │   │              last word, or do nothing        │      │
-       │   └───────────────────┬──────────────────────────┘      │
-       └───────────────────────┼─────────────────────────────────┘
-                               │  until "finish" wins, or 50 rounds
-                               ▼
-                             answer
-```
-
-Every question is a [Noul](https://docs.typesafe.ai/primitives/noul): a statement Jev rates with the probability that it is true. Questions in one request are judged independently and in parallel, so a round is four HTTP requests and about two seconds.
-
-1. **Scout.** For each of the 3,000 words in the vocabulary, ask whether it could be one of the next three words of the answer. Keep the 30 most probable.
-2. **Arrange.** Build every one- and two-word phrase from those 30 words, 900 in total. For each, ask whether appending it would be a good continuation. Three more questions offer the other moves: take the last word back, pass this round, or declare the answer finished.
-3. **Apply** whichever single question scored highest, and go again.
-
-The state sent with every question holds the rules of the game, the question being answered, the answer so far, and the last ten moves, so the model can keep extending the sentence it started instead of looping.
-
 ## Run it
 
-You need Python 3.12+, [uv](https://docs.astral.sh/uv/), and a TypeSafe API key from [console.typesafe.ai](https://console.typesafe.ai).
+```bash
+# 1. Copy the example environment file
+$ cp .env.example .env
 
-```sh
-cp .env.example .env            # then paste your key after TYPESAFE_API_KEY=
-uv run talk.py "Why is the sky blue?"
+# 2. Paste your TypeSafe API key into the .env file
+
+# 3. Run the talk script with your question
+$ uv run talk.py "What is the capital of France?"
 ```
 
-Flags:
-
-```sh
-uv run talk.py -v "Why is the sky blue?"                            # print every round's judgments and the token count
-uv run talk.py --vocab basic-english-850.txt "Why is the sky blue?"  # speak Ogden's Basic English instead
+Use custom dictionary with the `--vocab` flag.
+```bash
+$ uv run talk.py --vocab basic-english-850.txt "Why is the sky blue?"
 ```
 
-Stop a run with Ctrl-C. Redirect stdout and you get just the answer, no animation.
+See some debug info with the `-v` flag.
+```bash
+$ uv run talk.py -v "What is the most successful scam in history?"
+```
+
+Stop a run with Ctrl-C.
 
 ## What it says
 
@@ -82,7 +44,77 @@ Real answers, unedited, from the runs used to test this version:
 | What happens after we die? | is unknown |
 | How do I become rich? | start by working hard then save enough money for investment to grow your portfolio |
 
-Ask the same question twice and you may get a different answer; on another run the sky was blue "because the air contains certain components responsible for making it blue". It is also capable of a sixty-word run-on sentence about a "peter flat" when asked about the most successful scam in history. "Finish" competes with 900 phrases every round and sometimes keeps losing by a hair.
+There was also many uninterested, nonsensical responses, but this is fine.
+
+## How it works
+
+Given the dictionary it evaluates what is the probability of each word being the next word in the sequence. It can be done thanks to the parallel processing of questions on Jev.
+
+```mermaid
+flowchart LR
+    input["What is the capital of France?"]
+    
+    q1["Is 'the' best next word?"]
+    q2["Is 'of' the best next word?"]
+    q3["Is 'paris' the best next word?"]
+    q4[...]
+    q5["Is 'lights' the best next word?"]
+    input --> q1
+    input --> q2
+    input --> q3
+    input --> q4
+    input --> q5
+
+    p1["p(0.02)"]
+    p2["p(0.15)"]
+    p3["p(0.78)"]
+    p4[...]
+    p5["p(0.01)"]
+
+    q1 --> p1
+    q2 --> p2
+    q3 --> p3
+    q4 --> p4
+    q5 --> p5
+
+    top["Pick top 20 probable words. Create all possible permutations from them. Add top words to the state of current round."]
+    p1 --> top
+    p2 --> top
+    p3 --> top
+    p4 --> top
+    p5 --> top
+
+    q6["Is 'paris' the best next word?"]
+    q7["Is 'of paris' the best next words?"]
+    q8["Is 'the capital' the best next words?"]
+    q9[...]
+    q10["Is 'paris the' the best next words?"]
+
+    top --> q6
+    top --> q7
+    top --> q8
+    top --> q9
+    top --> q10
+
+    p6["p(0.95)"]
+    p7["p(0.32)"]
+    p8["p(0.12)"]
+    p9["p(0.08)"]
+    p10["p(0.03)"]
+
+    q6 --> p6
+    q7 --> p7
+    q8 --> p8
+    q9 --> p9
+    q10 --> p10
+
+    last["Add 'paris' to the response."]
+    p6 --> last
+    p7 --> last
+    p8 --> last
+    p9 --> last
+    p10 --> last
+```
 
 ## Cost and speed
 
