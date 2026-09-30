@@ -1,9 +1,9 @@
 [project]
-name = "jev-diffusion"
+name = "jev-talks"
 version = "0.1.0"
-description = "Add your description here"
+description = "Make a model that cannot write talk, one yes/no judgment at a time"
 readme = "README.md"
-requires-python = ">=3.12.13"
+requires-python = ">=3.12"
 dependencies = [
     "python-dotenv>=1.2.3",
     "typesafe-sdk>=0.7.2",
