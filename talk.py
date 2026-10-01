@@ -4,19 +4,26 @@ Jev, TypeSafe's System One model, does not generate text. It takes some state
 plus typed questions and returns calibrated probabilities. This script composes
 an answer anyway, as a game played in rounds:
 
-  1. scout    ask, for each of 3,000 words, "could this be one of the next few
-              words of the answer?" and keep the 30 most likely
-  2. arrange  turn those into ~900 one- and two-word phrases and ask, for each,
-              "is appending this a good next move?", next to three other moves:
-              take the last word back, pass, or finish
-  3. apply    the single most probable move, then play the next round
+  1. scout    show the vocabulary in groups of 250 and ask each group "which of
+              these could be one of the next few words of the answer?"; keep
+              the 30 most probable words
+  2. arrange  build 240 one- and two-word phrases from them and ask, for each,
+              "placed at the end of the answer, would this read as natural,
+              correct English and lead to a good answer?", next to two more
+              yes/no questions: take the last word back, or finish
+  3. apply    the most probable move, then play the next round
 
-Usage:  uv run talk.py "Why is the sky blue?" [-v] [--vocab FILE]
+Scouting for the next round runs in the background while the current round is
+judged, so a round is one request of about 10,000 tokens and half a second.
+Three answers are composed in parallel, each from a differently grouped
+vocabulary, and Jev grades them on a rubric to keep the best one.
+
+Usage:  uv run talk.py "Why is the sky blue?" [-v] [--tries N] [--vocab FILE]
 Needs TYPESAFE_API_KEY, from the environment or a .env file.
 """
 
 import argparse
-import math
+import random
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -24,35 +31,36 @@ from itertools import cycle, permutations
 from pathlib import Path
 
 from dotenv import load_dotenv
-from typesafe_sdk import Noul, TypeSafeClient, TypeSafeError
+from typesafe_sdk import Choice, Noul, Question, Score, TypeSafeClient, TypeSafeError
 
 # Settings --------------------------------------------------------------------
 
 VOCABULARY = Path(__file__).with_name("top-english-3000.txt")
-LOOKAHEAD = 3  # scouting asks: could the word be one of the next LOOKAHEAD words?
+LOOKAHEAD = 3  # scouting asks which word could be one of the next LOOKAHEAD words
+GROUP = 250  # words per scouting question; a Choice takes at most 255 options
 TOP_WORDS = 30  # scouted words that advance to arranging
-PHRASE = 2  # longest phrase placed in one move; 30 words make 30 + 870 phrases
+PAIRS_FROM = 15  # two-word phrases are built from the best PAIRS_FROM of them: 30 + 15 * 14 = 240 phrases
 TAIL = 10  # words of the answer quoted in each phrase question, to bound the request size
-BATCH = 1000  # words per scouting request, to fit Jev's 64k-token window
+STALE = 2  # rounds a scouting result may be reused before waiting for a fresh one
 MEMORY = 10  # recent moves the model gets to see, so it does not loop
-MAX_ROUNDS = 50
+LONG = 15  # from this many words on, the state notes that the answer is long and should be finished
+MAX_ROUNDS = 30  # every run that went past 30 rounds in testing was garbage
+TRIES = 3  # answers composed in parallel; the best by Jev's grade is kept
 
-PHRASES = sum(math.perm(TOP_WORDS, n) for n in range(1, PHRASE + 1))  # candidate phrases per round
-REMOVE, PASS, FINISH = "<take the last word back>", "<pass>", "<finish>"
-OTHER_MOVES = ["take the last word back", "pass: place nothing this round", "finish: the answer is complete"]
+PHRASES = TOP_WORDS + PAIRS_FROM * (PAIRS_FROM - 1)
+REMOVE, FINISH = "<take the last word back>", "<finish>"
 
 RULES = (
     "You are composing an answer to `question` word by word, in rounds of two phases."
-    f" Scouting: every vocabulary word is rated on whether it could be one of the next {LOOKAHEAD} words."
-    f" Arranging: the {TOP_WORDS} best-rated words (`scouted_words`) are combined into short phrases"
-    " (`candidates`) and each is judged as a possible next move, next to three other moves: take the"
-    " last word back, pass this round, or finish."
+    " Scouting: the vocabulary is shown in groups, and each group is asked which of its words could be one"
+    f" of the next {LOOKAHEAD} words of the answer."
+    f" Arranging: the {TOP_WORDS} best-rated words are combined into short phrases, and each phrase is judged"
+    " as a possible next move, next to two other moves: take the last word back, or finish."
     " `answer` is the answer so far; a space is added automatically when a phrase is placed."
     " Judge every question on its own: is this the best next move toward a short, good answer?"
-    " The candidates were scouted as likely, so usually one of them fits; pass only when all read wrong."
-    " `recent_moves` lists the latest moves, oldest first. Stay consistent and avoid loops: keep"
-    " extending the sentence already built, do not place words that were taken back, and after a"
-    " pass favor different words."
+    " Answer in one complete sentence of several words; a single word or a fragment is never a finished answer."
+    " `recent_moves` lists the latest moves, oldest first. Stay consistent and avoid loops: keep extending"
+    " the sentence already built, and do not place words that were taken back."
 )
 
 VERBOSE = False
@@ -62,61 +70,85 @@ VERBOSE = False
 
 
 class Composer:
-    def __init__(self, jev: "Jev", vocabulary: list[str], question: str):
-        self.jev, self.vocabulary, self.question = jev, vocabulary, question
+    def __init__(self, jev: "Jev", vocabulary: list[str], question: str, label: str = ""):
+        self.jev, self.vocabulary, self.question, self.label = jev, vocabulary, question, label
         self.answer: list[str] = []
         self.history: list[str] = []
+        self.rejected: set[str] = set()  # answers that were taken back from; never retried
 
-    def run(self) -> str:
-        for n in range(1, MAX_ROUNDS + 1):
-            log(f"\nround {n}, answer so far: {self.text!r}")
-            with Spinner(self.text, f"scouting {len(self.vocabulary):,} words") as spinner:
-                words = self.scout()
-                spinner.status = f"judging {PHRASES:,} phrases"
-                move = self.arrange(words)
-            if move == FINISH:
-                break
-            self.apply(move)
+    def run(self, spinner: "Spinner | None" = None) -> str:
+        """Play rounds until the model finishes. Scouting overlaps the previous round's arranging."""
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            scouting = pool.submit(self.scout, self.text)
+            candidates, age = [], STALE
+            for n in range(1, MAX_ROUNDS + 1):
+                self.log(("" if self.label else "\n") + f"round {n}, answer so far: {self.text!r}")
+                if scouting and (scouting.done() or age >= STALE):
+                    self.tell(spinner, f"scouting {len(self.vocabulary):,} words")
+                    candidates, age, scouting = scouting.result(), 0, None
+                self.tell(spinner, f"judging {PHRASES} phrases")
+                move = self.arrange(candidates)
+                if move == FINISH:
+                    break
+                self.apply(move)
+                self.tell(spinner, None)
+                age += 1
+                if scouting is None:
+                    scouting = pool.submit(self.scout, self.text)
         return self.text
 
-    def scout(self) -> list[str]:
-        """Rate every vocabulary word, in parallel batches, and keep the TOP_WORDS best."""
-        state = self.state(phase="scouting: rate each word's chance to appear among the next words")
-        batches = [self.vocabulary[i : i + BATCH] for i in range(0, len(self.vocabulary), BATCH)]
-        with ThreadPoolExecutor() as pool:
-            results = pool.map(lambda words: self.jev(state, scouting_questions(words)), batches)
-        probabilities = {word: p for result in results for word, p in result.items()}
+    def scout(self, answer: str) -> list[str]:
+        """One request: a multiple-choice question per group of words. Keep the TOP_WORDS most probable."""
+        state = self.state(answer, phase="scouting: which words could appear among the next words")
+        groups = [self.vocabulary[i : i + GROUP] for i in range(0, len(self.vocabulary), GROUP)]
+        answers = self.jev(state, {f"group{i}": scouting_question(group) for i, group in enumerate(groups)})
+        probabilities = {word: p for answer in answers.values() for word, p in answer.probabilities.items()}
         words = top(probabilities, TOP_WORDS)
-        log("  scouted:", show(probabilities, words[:10]), "...")
+        self.log("  scouted:", show(probabilities, words[:10]), "...")
         return words
 
     def arrange(self, words: list[str]) -> str:
-        """Judge every phrase made of the scouted words, and the three other moves; pick the best."""
-        phrases = [" ".join(p) for n in range(1, PHRASE + 1) for p in permutations(words, n)]
-        state = self.state(
-            phase="arranging: choose the best next move", scouted_words=words, candidates=phrases, other_moves=OTHER_MOVES
-        )
-        probabilities = self.jev(state, arranging_questions(self.answer, phrases))
+        """One request: a yes/no question per phrase, plus taking back and finishing. The most probable wins."""
+        phrases = words + [" ".join(pair) for pair in permutations(words[:PAIRS_FROM], 2)]
+        phrases = [p for p in phrases if f"{self.text} {p.split()[0]}".strip() not in self.rejected]
+        state = self.state(self.text, phase="arranging: choose the best next move")
+        answers = self.jev(state, arranging_questions(self.answer, phrases))
+        probabilities = {name: answer.noul for name, answer in answers.items()}
         moves = top(probabilities, 5)
-        log("  moves:  ", show(probabilities, moves))
+        self.log("  moves:  ", show(probabilities, moves))
         return moves[0]
 
     def apply(self, move: str) -> None:
         if move == REMOVE:
+            self.rejected.add(self.text)
             taken = self.answer.pop()
             self.remember(f"took back {taken!r}; the answer now reads {self.text!r}")
-        elif move == PASS:
-            self.remember("passed: none of the candidates fit")
         else:
             self.answer += move.split()
             self.remember(f"placed {move!r}; the answer now reads {self.text!r}")
 
+    def tell(self, spinner: "Spinner | None", status: str | None) -> None:
+        """Update the terminal animation, when there is one, with the answer so far and what Jev is doing."""
+        if spinner:
+            spinner.text = self.text
+            if status:
+                spinner.status = status
+
+    def log(self, *parts: object) -> None:
+        log(*((f"[{self.label}]",) if self.label else ()), *parts)
+
     def remember(self, what: str) -> None:
-        log("  ->", what)
+        self.log("  ->", what)
         self.history = (self.history + [what])[-MEMORY:]
 
-    def state(self, **extra) -> dict:
-        return {"rules": RULES, "question": self.question, "answer": self.text, "recent_moves": self.history, **extra}
+    def state(self, answer: str, **extra) -> dict:
+        state = {"rules": RULES, "question": self.question, "answer": answer, "recent_moves": self.history, **extra}
+        if len(answer.split()) >= LONG:  # Jev cannot count, but it reads a plain statement literally
+            state["length"] = (
+                f"The answer already has {len(answer.split())} words, which is long. Finish it as soon as it is"
+                " a complete sentence; add a word only if the sentence cannot end without it."
+            )
+        return state
 
     @property
     def text(self) -> str:
@@ -126,31 +158,28 @@ class Composer:
 # The questions ---------------------------------------------------------------
 
 
-def scouting_questions(words: list[str]) -> dict[str, Noul]:
-    return {word: Noul(instructions=f"Could {word!r} be one of the next {LOOKAHEAD} words of the answer?") for word in words}
+def scouting_question(words: list[str]) -> Choice:
+    return Choice(
+        instructions=f"Which of these words is the most likely to be one of the next {LOOKAHEAD} words of the answer?"
+        " Every option is a vocabulary word to be placed literally, not a meta answer.",
+        criteria={word: None for word in words},
+    )
 
 
-def arranging_questions(answer: list[str], phrases: list[str]) -> dict[str, Noul]:
+def arranging_questions(answer: list[str], phrases: list[str]) -> dict[str, Question]:
     def outcome(phrase: str) -> str:
         if len(answer) <= TAIL:
             return f"would change the answer to {' '.join(answer + [phrase])!r}"
         return f"would make the answer end with {'... ' + ' '.join(answer[-TAIL:] + [phrase])!r}"
 
-    questions = {
+    part = "a good continuation of" if answer else "a good beginning of"
+    questions: dict[str, Question] = {
         phrase: Noul(
-            instructions=f"Placing {phrase!r} {outcome(phrase)}."
-            " Would that be a good continuation of the answer that `question` asks for?"
+            instructions=f"Placing {phrase!r} {outcome(phrase)}. Would the answer then read as natural, correct"
+            f" English, and be {part} a complete, informative answer to `question`?"
         )
         for phrase in phrases
     }
-    questions[PASS] = Noul(
-        instructions="Does none of the phrases in `candidates` fit as a good continuation of `answer`,"
-        " so that nothing should be placed this round?",
-        criteria={
-            "true": "Every candidate would make the answer worse; better to place nothing this round.",
-            "false": "At least one candidate is a genuinely good continuation.",
-        },
-    )
     if answer:
         text, shorter = " ".join(answer), " ".join(answer[:-1])
         questions[REMOVE] = Noul(
@@ -164,11 +193,26 @@ def arranging_questions(answer: list[str], phrases: list[str]) -> dict[str, Noul
             instructions=f"The answer so far is {text!r}. Is it already a complete, good answer to `question`,"
             " so composing should stop?",
             criteria={
-                "true": "The answer is complete and good; more words would make it worse.",
-                "false": "The answer is unfinished or still contains a wrong word.",
+                "true": "The answer is a complete sentence of several words that fully answers the question;"
+                " more words would make it worse.",
+                "false": "The answer is a single word, a fragment, unfinished, or still contains a wrong word.",
             },
         )
     return questions
+
+
+def grading_question() -> Score:
+    return Score(
+        instructions="Grade `answer` as an answer to `question`. It is lowercase and has no punctuation by"
+        " construction; ignore that and judge the words.",
+        criteria=[
+            "not an answer: empty, nonsense, repetitive, or unrelated to the question",
+            "poor: a fragment that stops mid-thought, or a wrong or contradictory claim",
+            "fair: on topic and understandable, but incomplete, awkward, or too vague to be useful",
+            "good: a complete, natural sentence that answers the question sensibly",
+            "excellent: a complete, natural, informative sentence a thoughtful person might have written",
+        ],
+    )
 
 
 def top(probabilities: dict[str, float], n: int) -> list[str]:
@@ -193,19 +237,19 @@ def animated() -> bool:
 
 
 class Jev:
-    """The TypeSafe client, reduced to one call that returns each question's probability of yes."""
+    """The TypeSafe client, reduced to one call that returns the answers by question name."""
 
     def __init__(self):
         self.client = TypeSafeClient()
         self.lock = threading.Lock()
         self.requests = self.tokens = 0
 
-    def __call__(self, state: dict, questions: dict[str, Noul]) -> dict[str, float]:
+    def __call__(self, state: dict, questions: dict[str, Question]) -> dict:
         response = self.client.system_one(state=state, questions=questions)
         with self.lock:
             self.requests += 1
             self.tokens += response.usage.input_tokens or 0
-        return {name: answer.noul for name, answer in response.nouls.items()}
+        return response.answers
 
 
 class Spinner:
@@ -237,6 +281,28 @@ class Spinner:
             sys.stdout.flush()
 
 
+def compose(jev: Jev, words: list[str], question: str, tries: int) -> str:
+    """Compose `tries` answers in parallel, each from a differently grouped vocabulary, and keep the best."""
+    def one(seed: int, spinner: Spinner | None) -> str:
+        vocabulary = list(words)
+        random.Random(seed).shuffle(vocabulary)  # so every scouting group mixes common and rare words
+        label = "ABCDEFGH"[seed % 8] if tries > 1 else ""
+        return Composer(jev, vocabulary, question, label).run(spinner)
+
+    with Spinner("", "starting") as spinner:
+        with ThreadPoolExecutor() as pool:  # the animation follows the first answer
+            answers = list(pool.map(lambda seed: one(seed, spinner if seed == 0 else None), range(tries)))
+        if tries == 1:
+            return answers[0]
+        spinner.status = f"grading {tries} answers"
+        grades = {}
+        for answer in dict.fromkeys(answers):
+            grades[answer] = jev({"question": question, "answer": answer}, {"grade": grading_question()})["grade"].score
+            log(f"\ngrade {grades[answer]:.2f}  {answer!r}")
+        spinner.text = max(grades, key=grades.get)
+    return spinner.text
+
+
 def main() -> None:
     global VERBOSE
     parser = argparse.ArgumentParser(
@@ -244,6 +310,7 @@ def main() -> None:
     )
     parser.add_argument("question")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every round's judgments and the token usage")
+    parser.add_argument("--tries", type=int, default=TRIES, help="compose this many answers in parallel and keep the best")
     parser.add_argument("--vocab", type=Path, default=VOCABULARY, help="word list to compose from, one word per line")
     args = parser.parse_args()
     VERBOSE = args.verbose
@@ -251,8 +318,7 @@ def main() -> None:
     load_dotenv()
     try:
         jev = Jev()
-        composer = Composer(jev, args.vocab.read_text().lower().split(), args.question)
-        answer = composer.run()
+        answer = compose(jev, args.vocab.read_text().lower().split(), args.question, args.tries)
     except KeyboardInterrupt:
         sys.exit("\n(stopped)")
     except (TypeSafeError, OSError) as error:
