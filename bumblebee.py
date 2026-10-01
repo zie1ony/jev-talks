@@ -1,21 +1,28 @@
-"""Make a model that cannot write talk, by filling in sentence templates.
+"""Hold a conversation with a model that cannot write, by filling in sentence templates.
 
 Jev, TypeSafe's System One model, does not generate text. It takes some state
 plus typed questions and returns calibrated probabilities. diffuse.py rewrites
 a row of loose words until it reads like a sentence; this script keeps that
-loop and gives it a skeleton to work on. Every sentence starts as a template
-with blanks, such as "_ is _ because _.", and a blank takes a word, or a
-clause template with blanks of its own:
+loop, gives it a skeleton to work on, and talks with it. You talk to
+Bumblebee, a friendly yellow Autobot who answers very honestly and to the
+point, and then adds what is worth knowing. Your message opens the
+conversation, Bumblebee replies, and you are asked for the next message until
+Ctrl-C ends it; with --just-answer there is one reply and no conversation.
+
+Every sentence of a reply starts as a template with blanks, such as
+"_ is _ because _.", and a blank takes a word, or a clause template with
+blanks of its own:
 
   1. plan    before every sentence, one request asks which sentence
              template it should follow. <END> is one of the options; when
-             it is the most probable one, the response is over. With -n the
-             response has exactly that many sentences, and <END> is not an
+             it is the most probable one, the reply is over. With -n the
+             reply has exactly that many sentences, and <END> is not an
              option. Before the first sentence the same request scouts the
-             vocabulary in groups of 250 for the words the response could
-             use; the words of the question join the vocabulary first. The
-             100 likeliest words, the 60 most frequent ones and the words
-             of the question are the pool for every blank of the response.
+             vocabulary in groups of 250 for the words the reply could use;
+             the words of the conversation and of the persona join the
+             vocabulary first. The 100 likeliest words, the 60 most frequent
+             ones and the words of the last message are the pool for every
+             blank of the reply.
   2. write   one request asks every blank "which word belongs here?" and
              "which sentence pattern would a clause here give?". A blank
              that prefers a clause becomes that clause, and the next pass
@@ -25,8 +32,9 @@ clause template with blanks of its own:
              probable sentence is written.
   3. judge   one request about the finished sentence: for every word in a
              blank, "is it wrong here?" and "is it a name?", and about the
-             whole, "is this a good sentence for the answer?". A name gets
-             a <CAP> tag in front of it.
+             whole, "is this a good sentence for the reply?". A name gets
+             a <CAP> tag in front of it; so do, without asking, the word I
+             and the names in the persona.
   4. change  up to 3 of the most doubted words are blanked again, and step
              2 fills them anew, with the old word still in the running
   5. stop    once the sentence is at least 0.6 probably good, when no word
@@ -35,33 +43,41 @@ clause template with blanks of its own:
              judged is kept
 
 The three most probable templates are filled in parallel, and the sentence
-that ranks highest goes into the response. The rank is how probably good Jev
+that ranks highest goes into the reply. The rank is how probably good Jev
 finds the sentence, times the fourth root of the template's probability, so
 of two about equally good sentences the more probable template wins. Without
 -n, a sentence after the first is kept only if it is good; otherwise the
-response ends there.
+reply ends there.
 
-The response is a row of tokens: lowercase words, the marks . , ? ! and two
+The reply is a row of tokens: lowercase words, the marks . , ? ! and two
 tags. <CAP> makes the next word capital, and every template starts with one.
-<END> closes the response. "<CAP> paris is the capital of <CAP> france . <END>"
+<END> closes the reply. "<CAP> paris is the capital of <CAP> france . <END>"
 is printed as "Paris is the capital of France."
 
 Every request is a state plus questions. The state holds what the questions
-share: the rules, the question, the response so far and the draft. While the
-blanks are filled the draft shows them numbered, so the question about a blank
-is one short line. What a request costs is its options, about 6 tokens each,
-which is why the vocabulary is scouted once per response, and why a blank
-right after "a" or "the" is not offered the clauses that cannot follow it.
+share. It starts with what a chat model would get as its system prompt: the
+persona, which says who Bumblebee is and how Bumblebee answers, and the rules,
+which say that the next element of the conversation is being written. Then
+comes the conversation, every message so far with who it is from, and after it
+the reply in the making: the sentences that are written and the draft of the
+next one. While the blanks are filled the draft shows them numbered, so the
+question about a blank is one short line. What a request costs is its options,
+about 6 tokens each, which is why the vocabulary is scouted once per reply,
+and why a blank right after "a" or "the" is not offered the clauses that
+cannot follow it.
 
-An answer averages two sentences, 4 seconds and 80,000 tokens, a third of a
-cent: 23,000 for the first plan with its scouting, 3,500 for every later plan,
-and three or four requests for most templates.
+A reply has one to four sentences. To small talk it is one or two, in 2 to 4
+seconds and about 45,000 tokens. Where there is something to explain it is
+three or four, in about 7 seconds and 120,000 tokens, half a cent: 23,000 for
+the first plan with its scouting, 3,700 for every later plan, the one that
+ends the reply included, and three or four requests for most templates.
 
-Usage:  uv run bumblebee.py "Why is the sky blue?" [-v | --debug] [-n SENTENCES] [--tries N] [--vocab FILE]
+Usage:  uv run bumblebee.py "How are you?" [--just-answer] [-v | --debug] [-n SENTENCES] [--tries N] [--vocab FILE]
 Needs TYPESAFE_API_KEY, from the environment or a .env file.
 """
 
 import argparse
+import contextlib
 import random
 import re
 import sys
@@ -76,9 +92,20 @@ from typesafe_sdk import Choice, Noul, Question, TypeSafeClient, TypeSafeError
 
 # Settings --------------------------------------------------------------------
 
+NAME, USER = "Bumblebee", "user"  # who a message of the conversation is from
+# Who replies, and how. Its words join the vocabulary. The last part, about more that is worth knowing, is what makes
+# a reply go on after its first sentence; without it nearly every reply is one short sentence. The words are chosen
+# with care, since Jev leans toward whatever the persona mentions. One that speaks of not knowing makes "I do not
+# know." the favourite reply to questions that have an answer, one that speaks of "the answer" brings up the template
+# "The answer is ___.", and one that asks for reasons makes the second sentence start with "That is because".
+PERSONA = (
+    f"{NAME} is a friendly yellow Autobot. {NAME} answers very honestly and to the point, and knows a lot: every reply"
+    f" first says the best and truest thing {NAME} has to say, in plain words, and then goes on with more that is true"
+    " and worth knowing about it, so that the user learns something."
+)
 VOCABULARY = Path(__file__).with_name("top-english-3000.txt")
 GROUP = 250  # words per scouting question, templates per planning question; a Choice takes at most 255 options
-SIZE = 4  # sentences the response may have when -n does not say how many; <END> usually stops it earlier
+SIZE = 4  # sentences a reply may have when -n does not say how many; <END> usually stops it earlier
 PLACES = 12  # blanks a sentence may have; past that no blank becomes a clause
 SCOUTED = 100  # scouted words that join the pool
 COMMON = 60  # words from the top of the vocabulary file, its most frequent ones, that are always in the pool
@@ -91,25 +118,30 @@ PRIOR = 0.25  # power of the template's probability in a sentence's rank; 0 rank
 MAX_PASSES = 8  # hard stop: requests per row
 TRIES = 3  # templates filled in parallel for every sentence; the sentence that ranks highest is kept
 
-CAP, END = "<CAP>", "<END>"  # tags among the words: the next word is capital, the response is over
+CAP, END = "<CAP>", "<END>"  # tags among the words: the next word is capital, the reply is over
 MARKS = ".,?!"
 BLANK = "___"  # how Jev and the terminal see a blank; the templates below spell it _
 NOTHING, QUALITY = "<no word>", "<quality>"
 # After one of these words only a word of its own phrase can come, so a blank there is not offered the clauses that
 # start with a fixed word, such as "a because ___ is ___". That spares Jev four fifths of the patterns to read.
 HEADS = {"a", "an", "the", "my", "your", "its", "their", "our", "no", "every", "very", "more", "most"}
+# Words that get a capital letter without Jev being asked: the word I, and what the persona writes with a capital
+# inside a sentence. Jev cannot know that a made-up word such as Autobot is a name.
+NAMES = {"i"} | {word.lower() for word in re.findall(r"(?<=[a-z,] )[A-Z][a-z]+", PERSONA)}
 
-RULES = (
-    "An answer to `question` is being written sentence by sentence. `written` holds the sentences that are"
-    " finished; it is empty while the first sentence is being written. `draft` is the sentence that comes next."
-    " Every ___ in the draft is a blank that is filled later."
+TALK = (  # the rules of every request: what the conversation is, and that its next element is being written
+    f"`conversation` is a talk between a user and {NAME}, the oldest message first. {NAME} is the character that"
+    f" `persona` describes. The next element of `conversation` is being written: {NAME}'s reply to the last message."
 )
+SENTENCE = (
+    " The reply is written sentence by sentence. `written` holds the sentences that are finished; it is empty while"
+    " the first sentence is being written. `draft` is the sentence that comes next."
+)
+RULES = TALK + SENTENCE + " Every ___ in the draft is a blank that is filled later."
 WRITING = (  # the rules while blanks are filled: the draft shows them numbered, so that a question can be short
-    "An answer to `question` is being written sentence by sentence. `written` holds the sentences that are"
-    " finished; it is empty while the first sentence is being written. `draft` is the sentence that comes next."
-    " Every number in brackets in it is a blank that takes one word. A word question asks which word should stand"
-    " at one of the blanks so that the finished sentence {aim}. Every option of it is a word to be placed"
-    " literally; <no word> means the sentence is better without that blank."
+    TALK + SENTENCE + " Every number in brackets in it is a blank that takes one word. A word question asks which"
+    " word should stand at one of the blanks so that the finished sentence {aim}. Every option of it is a word to be"
+    " placed literally; <no word> means the sentence is better without that blank."
 )
 
 # The templates ---------------------------------------------------------------
@@ -117,6 +149,7 @@ WRITING = (  # the rules while blanks are filled: the draft shows them numbered,
 # A sentence template is written as it reads. _ is a blank: it takes a word of the pool, sometimes two, or one of
 # the clause templates further down, whose blanks are filled the same way. A capital letter becomes a <CAP> tag in
 # front of the word, and every sentence starts with one. "a" turns into "an" by the word that ends up after it.
+# Some templates have no blank: what a conversation needs said as it is, such as "You are welcome." or "Goodbye!".
 SENTENCES = """
 It is _.
 It is a _.
@@ -285,6 +318,8 @@ I am a _ _.
 I am not _.
 I am not a _.
 I am not sure.
+I am sorry.
+I am sorry to hear that.
 I am here to _.
 I can _.
 I can _ you _.
@@ -305,7 +340,11 @@ I will _.
 I would say _.
 I was made to _.
 My _ is _.
+Your _ is _.
 You are _.
+You are welcome.
+You have _.
+You _ _.
 You can _.
 You can _ by _.
 You can _ and _.
@@ -392,16 +431,30 @@ What if _ is _?
 What is _?
 What do you _?
 What about _?
+What happened?
+What do you mean?
 Who knows?
+Why?
 Why not?
+Why do you _?
+Why are you _?
+How are you?
+How can I help you?
+And you?
 Do you _?
 Are you _?
 Can you _?
 Hello!
 Hello, I am _.
+Nice to meet you.
+Nice to meet you, _.
+Goodbye!
 Thank you!
 Thank you for _.
 Sorry, _.
+Me too.
+I see.
+Tell me more.
 What a _!
 _!
 _ _!
@@ -557,13 +610,23 @@ class Word:
 
 
 Row = list["str | Word"]  # the tokens of a sentence in order: fixed words, marks and tags, and a Word for every blank
+Message = dict[str, str]  # one element of the conversation: who it is "from", USER or NAME, and its "text"
 
 
 class Diffusion:
     """One sentence: a template whose blanks are filled, judged and blanked again in passes."""
 
-    def __init__(self, jev: "Jev", pool: list[str], question: str, written: str, template: str, prior: float, label: str):
-        self.jev, self.pool, self.question, self.written, self.label = jev, pool, question, written, label
+    def __init__(
+        self,
+        jev: "Jev",
+        pool: list[str],
+        conversation: list[Message],
+        written: str,
+        template: str,
+        prior: float,
+        label: str,
+    ):
+        self.jev, self.pool, self.conversation, self.written, self.label = jev, pool, conversation, written, label
         self.template, self.prior = template, prior  # the prior is how probable Jev found the template
         self.row = pattern(template, sentence=True)
         self.passes = 0  # requests made so far
@@ -677,14 +740,16 @@ class Diffusion:
         questions: dict[str, Question] = {QUALITY: good_question(draft(self.row), self.written)}
         for i, place in enumerate(places):
             questions[f"doubt{i}"] = doubt_question(place.text)
-            questions[f"capital{i}"] = capital_question(place.text)
+            if place.text not in NAMES:
+                questions[f"capital{i}"] = capital_question(place.text)
         self.seen.add(draft(self.row).lower())
         answers = self.ask(questions)
+        names = [1.0 if place.text in NAMES else answers[f"capital{i}"].noul for i, place in enumerate(places)]
         for i, place in enumerate(places):
             place.doubt = answers[f"doubt{i}"].noul
-            self.capitalize(place, answers[f"capital{i}"].noul >= 0.5)
-        names = ", ".join(f"{place.text} {answers[f'capital{i}'].noul:.2f}" for i, place in enumerate(places))
-        self.log(f"pass {self.passes}, names:", names or "no word to ask about", level=2)
+            self.capitalize(place, names[i] >= 0.5)
+        shown = ", ".join(f"{place.text} {name:.2f}" for place, name in zip(places, names, strict=True))
+        self.log(f"pass {self.passes}, names:", shown or "no word to ask about", level=2)
         return answers[QUALITY].noul
 
     def capitalize(self, place: Word, capital: bool) -> None:
@@ -713,11 +778,11 @@ class Diffusion:
         self.log(f"  -> blanked again: {draft(self.row)!r}")
 
     def ask(self, questions: dict[str, Question], rules: str = RULES, numbered: bool = False) -> dict:
-        """One pass: a request whose state holds the rules, the question, the response so far and the sentence."""
+        """One pass: a request whose state holds the conversation, the reply so far and the sentence."""
         self.passes += 1
         self.tell(f"pass {self.passes}")
         sentence = draft(self.row, numbered=numbered)
-        return self.jev({"rules": rules, "question": self.question, "written": self.written, "draft": sentence}, questions)
+        return self.jev(state(rules, self.conversation, self.written, sentence), questions)
 
     def index(self, place: Word) -> int:
         return next(i for i, item in enumerate(self.row) if item is place)
@@ -861,19 +926,32 @@ def frames(row: Row, place: Word) -> dict[str, str]:
     return options
 
 
-# The questions ---------------------------------------------------------------
+# The state and the questions -------------------------------------------------
+
+
+def state(rules: str, conversation: list[Message], written: str, sentence: str | None = None) -> dict:
+    """What every question of a request reads: the system prompt, the conversation, and the reply in the making.
+
+    The persona and the rules are the system prompt. The reply is `written`, its finished sentences, and in a
+    request about one sentence the `draft` of that sentence.
+    """
+    found = {"persona": PERSONA, "rules": rules, "conversation": conversation, "written": written}
+    return found if sentence is None else {**found, "draft": sentence}
 
 
 def aim_of(written: str) -> str:
     if written:
-        return "reads as natural, correct English and is a good next sentence after `written` in the answer to `question`"
-    return "reads as natural, correct English and answers `question` well"
+        return (
+            "reads as natural, correct English and is a good next sentence after `written` in"
+            f" {NAME}'s reply to the last message of `conversation`"
+        )
+    return f"reads as natural, correct English and is a good reply by {NAME} to the last message of `conversation`"
 
 
 def scouting_question(words: list[str]) -> Choice:
     return Choice(
-        instructions="Which of these words is the most likely to appear in a good answer to `question`?"
-        " Every option is a vocabulary word to be used literally, not a meta answer.",
+        instructions=f"Which of these words is the most likely to appear in a good reply by {NAME} to the last message"
+        " of `conversation`? Every option is a vocabulary word to be used literally, not a meta answer.",
         criteria={word: None for word in words},
     )
 
@@ -882,13 +960,17 @@ def planning_question(templates: list[str], written: str, ending: bool) -> Choic
     options: dict[str, str | None] = {draft(pattern(template, sentence=True)): None for template in templates}
     if written:
         text = (
-            "A good answer to `question` is being written sentence by sentence; `written` holds the sentences so far."
-            " Which pattern should the next sentence follow, the one that comes right after `written`?"
+            f"A good reply by {NAME} to the last message of `conversation` is being written sentence by sentence;"
+            " `written` holds the sentences so far. Which pattern should the next sentence follow, the one that comes"
+            " right after `written`?"
         )
         if ending:
-            options[END] = "No more sentences: `written` is already a complete answer to `question`."
+            options[END] = "No more sentences: `written` is already a complete reply to the last message."
     else:
-        text = "A good answer to `question` is being written. Which pattern should its first sentence follow?"
+        text = (
+            f"A good reply by {NAME} to the last message of `conversation` is being written. Which pattern should its"
+            " first sentence follow?"
+        )
     return Choice(
         instructions=text + " Every ___ in a pattern stands for a word or a short phrase that is filled in afterwards;"
         " the other words of the pattern are used literally.",
@@ -919,15 +1001,15 @@ def frame_question(row: Row, place: Word, aim: str) -> Choice:
 def doubt_question(word: str) -> Noul:
     return Noul(
         instructions=f"Is the word {word!r} wrong in `draft`: out of place, ungrammatical, repeated, or making the"
-        " answer incorrect?"
+        " reply incorrect?"
     )
 
 
 def capital_question(word: str) -> Noul:
     return Noul(
-        instructions=f"Does correct English write the word {word!r} of `draft` with a capital first letter wherever"
-        " it stands in a sentence: is it the name of a person, a place, a people, a language, a day or a month, or"
-        " the word I?"
+        instructions=f"Is the word {word!r} of `draft` a proper noun, which correct English writes with a capital"
+        " first letter wherever it stands in a sentence: the name of a person or a character, a place, a people, a"
+        " language, a day or a month?"
     )
 
 
@@ -935,9 +1017,13 @@ def good_question(sentence: str, written: str) -> Noul:
     if written:
         return Noul(
             instructions=f"Is {sentence!r} a complete, natural and correct sentence, and a good next sentence after"
-            " `written` in the answer to `question`: one that adds something and does not repeat it?"
+            f" `written` in {NAME}'s reply to the last message of `conversation`: one that adds something and does not"
+            " repeat it?"
         )
-    return Noul(instructions=f"Is {sentence!r} a complete, natural and correct answer to `question`?")
+    return Noul(  # a first sentence, not a whole reply: the persona wants more after it, and Jev would mark it down
+        instructions=f"Is {sentence!r} a complete, natural and correct sentence, and a good first sentence of {NAME}'s"
+        " reply to the last message of `conversation`: one that answers it directly?"
+    )
 
 
 def top(probabilities: dict[str, float], n: int) -> list[str]:
@@ -1007,13 +1093,19 @@ class Spinner:
 
 
 def plan(
-    jev: Jev, vocabulary: list[str], basics: list[str], question: str, written: str, ending: bool, pool: list[str]
+    jev: Jev,
+    vocabulary: list[str],
+    basics: list[str],
+    conversation: list[Message],
+    written: str,
+    ending: bool,
+    pool: list[str],
 ) -> tuple[list[str], dict[str, float], float]:
     """One request before every sentence: which template it should follow.
 
     Before the first sentence there is no `pool` yet, and the same request scouts the vocabulary for one: the
-    words the whole response could use. That is 3,000 options, most of the tokens of the request, so it is asked
-    once. <END> is among the templates only if the response may end here, which is what `ending` says.
+    words the whole reply could use. That is 3,000 options, most of the tokens of the request, so it is asked
+    once. <END> is among the templates only if the reply may end here, which is what `ending` says.
     Returns the pool, the templates by probability, and how probable <END> is.
     """
     m = -(-len(SENTENCES) // GROUP)  # as few groups as will fit, all of the same size
@@ -1022,7 +1114,7 @@ def plan(
     random.Random(0).shuffle(words)  # so every scouting group mixes common and rare words
     n = 0 if pool else -(-len(words) // GROUP)
     questions.update({f"group{i}": scouting_question(words[i::n]) for i in range(n)})
-    answers = jev({"question": question, "written": written}, questions)
+    answers = jev(state(TALK, conversation, written), questions)
     shown = {draft(pattern(template, sentence=True)): template for template in SENTENCES}
     templates = {shown[p]: v for i in range(m) for p, v in answers[f"plan{i}"].probabilities.items() if p != END}
     end = min(answers[f"plan{i}"].probabilities.get(END, 0.0) for i in range(m))
@@ -1047,11 +1139,11 @@ def fill(rows: list[Diffusion], spinner: Spinner) -> list[tuple[list[str], float
 
 
 def keep(rows: list[Diffusion], results: list[tuple[list[str], float]], written: str) -> int | None:
-    """Which row's sentence goes into the response: the one that ranks highest.
+    """Which row's sentence goes into the reply: the one that ranks highest.
 
     The rank is how probably good Jev found the sentence, times a root of how probable it found the template. So
     of two sentences that are about equally good, the one from the more probable template is kept; a sentence from
-    a less probable template has to be clearly better. A sentence that the response already has is never kept.
+    a less probable template has to be clearly better. A sentence that the reply already has is never kept.
     """
     ranks = [good * row.prior**PRIOR for row, (_, good) in zip(rows, results, strict=True)]
     fresh = [k for k, (tokens, _) in enumerate(results) if tokens and draft(tokens).lower() not in written.lower()]
@@ -1062,50 +1154,75 @@ def keep(rows: list[Diffusion], results: list[tuple[list[str], float]], written:
     return kept
 
 
-def compose(jev: Jev, words: list[str], question: str, tries: int, size: int, forced: bool = False) -> str:
-    """Write the response sentence by sentence: for each, fill the `tries` most probable templates and keep one.
+def compose(jev: Jev, words: list[str], conversation: list[Message], tries: int, size: int, forced: bool = False) -> str:
+    """Write the next element of the conversation, the reply to its last message, sentence by sentence.
 
-    The response has up to `size` sentences and ends sooner when <END> is the most probable template or the next
-    sentence is not good. When it is `forced`, it has exactly `size` sentences.
+    For each sentence the `tries` most probable templates are filled and one is kept. The reply has up to `size`
+    sentences and ends sooner when <END> is the most probable template or the next sentence is not good. When it
+    is `forced`, it has exactly `size` sentences.
     """
-    asked = [word.lower() for word in re.findall(r"[^\W_]+(?:['’-][^\W_]+)*", question)]
-    vocabulary = list(dict.fromkeys(words + asked))  # every word of the question can be used, whatever the word list has
+    said = [word for message in conversation for word in words_of(message["text"])]
+    # every word of the conversation and of the persona can be used, whatever the word list has
+    vocabulary = list(dict.fromkeys(words + words_of(PERSONA) + said))
+    asked = words_of(conversation[-1]["text"])
     basics = list(dict.fromkeys(asked + words[:COMMON]))  # these are in the pool of every sentence
-    response: list[str] = []
+    reply: list[str] = []
     used: set[str] = set()  # the templates of the sentences so far; none is used twice
     pool: list[str] = []  # the words every blank chooses from; scouted before the first sentence, kept for the rest
     note = ""
     with Spinner("", "starting") as spinner:
         for n in range(size):
-            written = draft(response)
+            written = draft(reply)
             spinner.text, spinner.status = written, f"{note}planning sentence {n + 1}"
-            pool, templates, end = plan(jev, vocabulary, basics, question, written, not forced, pool)
+            pool, templates, end = plan(jev, vocabulary, basics, conversation, written, not forced, pool)
             ranked = [template for template in top(templates, len(templates)) if template not in used]
-            if response and not forced and end >= max((templates[template] for template in ranked), default=0.0):
+            if reply and not forced and end >= max((templates[template] for template in ranked), default=0.0):
                 log(f"{END} is the most probable template")
                 break
             kept = None
             while kept is None and ranked:  # a forced sentence goes on to the next templates until one is written
                 labels = "ABCDEFGH" if tries > 1 else [""]
                 rows = [
-                    Diffusion(jev, pool, question, written, template, templates[template], labels[k % len(labels)])
+                    Diffusion(jev, pool, conversation, written, template, templates[template], labels[k % len(labels)])
                     for k, template in enumerate(ranked[:tries])
                 ]
                 results = fill(rows, spinner)
                 kept = keep(rows, results, written)
                 ranked = ranked[tries:] if forced else []
-            if kept is None or (response and not forced and results[kept][1] < GOOD):
+            if kept is None or (reply and not forced and results[kept][1] < GOOD):
                 log("no sentence came out of it" if kept is None else "it is not good enough to keep")
                 break
-            response += results[kept][0]
+            reply += results[kept][0]
             used.add(rows[kept].template)
-            spinner.text = draft(response)
+            spinner.text = draft(reply)
             first, good = results[0][1], results[kept][1]  # the animation followed the first row
             note = f"another template did better, {good:.2f} against {max(first, 0):.2f}; " if good > first else ""
-        response.append(END)
-        spinner.text = draft(response)  # a sentence that was not kept leaves the screen
-        log("\n" + " ".join(response))
-    return draft(response)
+        reply.append(END)
+        spinner.text = draft(reply)  # a sentence that was not kept leaves the screen
+        log("\n" + " ".join(reply))
+    return draft(reply)
+
+
+def words_of(text: str) -> list[str]:
+    """The words of a text, spelled as the vocabulary spells them: lowercase."""
+    return [word.lower() for word in re.findall(r"[^\W_]+(?:['’-][^\W_]+)*", text)]
+
+
+def hear() -> str | None:
+    """The user's next message, or None once Ctrl-C or the end of the input closes the conversation."""
+    asking = sys.stdin.isatty()
+    if asking:
+        with contextlib.suppress(ImportError):
+            import readline  # noqa: F401  # with it, the line can be edited and earlier messages recalled
+    try:
+        while True:
+            message = input("> " if asking else "").strip()
+            if message:
+                return message
+    except (KeyboardInterrupt, EOFError):
+        if asking:
+            print()
+        return None
 
 
 def main() -> None:
@@ -1113,7 +1230,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], epilog="Needs TYPESAFE_API_KEY, from the environment or a .env file."
     )
-    parser.add_argument("question")
+    parser.add_argument("message", help=f"what you say to {NAME} first")
+    parser.add_argument("--just-answer", action="store_true", help="reply to the message and exit; no conversation")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every pass's judgments and the token usage")
     parser.add_argument("--debug", action="store_true", help="print every proposal and verdict as well; no animation")
     parser.add_argument("-n", dest="size", type=int, metavar="SENTENCES", help="write exactly this many sentences")
@@ -1127,18 +1245,26 @@ def main() -> None:
     VERBOSE = 2 if args.debug else int(args.verbose)
 
     load_dotenv()
+    conversation: list[Message] = []  # every message so far, the user's and the replies, the oldest first
+    message: str | None = args.message
     try:
         words = list(dict.fromkeys(args.vocab.read_text().lower().split()))
         if not words:
             sys.exit(f"error: {args.vocab} has no words")
         jev = Jev()
-        answer = compose(jev, words, args.question, args.tries, args.size or SIZE, forced=args.size is not None)
+        while message is not None:
+            conversation.append({"from": USER, "text": message})
+            requests, tokens = jev.requests, jev.tokens
+            reply = compose(jev, words, conversation, args.tries, args.size or SIZE, forced=args.size is not None)
+            print(("\r\x1b[2K" if animated() else "") + (reply or "(no answer)"))
+            log(f"\n{jev.requests - requests} requests, {jev.tokens - tokens:,} input tokens")
+            if reply:
+                conversation.append({"from": NAME, "text": reply})
+            message = None if args.just_answer else hear()
     except KeyboardInterrupt:
         sys.exit("\n(stopped)")
     except (TypeSafeError, OSError) as error:
         sys.exit(f"error: {error}")
-    print(("\r\x1b[2K" if animated() else "") + (answer or "(no answer)"))
-    log(f"\n{jev.requests} requests, {jev.tokens:,} input tokens")
 
 
 if __name__ == "__main__":
